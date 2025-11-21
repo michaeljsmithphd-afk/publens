@@ -6,6 +6,7 @@ import io
 from datetime import datetime
 import calendar
 import urllib3
+import time
 
 # --- SSL FIX ---
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -79,23 +80,25 @@ def get_impact_factor(journal_name):
 
 def determine_article_type(type_string_or_list):
     if not type_string_or_list: return "Primary Research"
-    if isinstance(type_string_or_list, str): type_list = [type_string_or_list]
-    else: type_list = type_string_or_list
+    
+    if isinstance(type_string_or_list, str): 
+        type_list = [type_string_or_list]
+    else: 
+        type_list = type_string_or_list
+        
     for t in type_list:
-        if "Review" in str(t): return "Review"
+        t_str = str(t).lower()
+        if "preprint" in t_str: return "Preprint"
+        if "review" in t_str: return "Review"
+            
     return "Primary Research"
 
 def generate_citation(row):
-    """
-    Format: Pachynski RK, et al. Clin Cancer Res. 2021 Jun 15;27(12):3478-3490. DOI: 10.1158/...
-    """
     try:
-        # Authors: Take first one, add et al.
         authors = str(row.get("Authors", "")).split(",")[0]
         if "," in str(row.get("Authors", "")):
             authors += ", et al"
         
-        # Journal: Prefer Abbreviation (TA) -> Full Name (Journal)
         journal = row.get("Abbr", "")
         if not journal or journal == "nan":
             journal = row.get("Journal", "")
@@ -106,15 +109,11 @@ def generate_citation(row):
         pg = str(row.get("Pages", ""))
         doi = str(row.get("DOI", ""))
         
-        # Construct Citation parts
-        # Logic: Date;Vol(Issue):Pages.
         details = date
-        
         if vol and vol != "nan":
             details += f";{vol}"
             if issue and issue != "nan":
                 details += f"({issue})"
-        
         if pg and pg != "nan":
             details += f":{pg}"
             
@@ -129,7 +128,6 @@ def search_us_pubmed(query, max_results, email, start_date, end_date, exact_phra
     Entrez.email = email
     mindate = start_date.strftime("%Y/%m/%d")
     maxdate = end_date.strftime("%Y/%m/%d")
-    
     final_query = f'"{query}"' if exact_phrase else query
     
     try:
@@ -162,20 +160,17 @@ def search_us_pubmed(query, max_results, email, start_date, end_date, exact_phra
         data = []
         for record in records:
             j_name = record.get("JT", "")
-            j_abbr = record.get("TA", "") # Abbreviation (e.g. Clin Cancer Res)
+            j_abbr = record.get("TA", "")
             
             if_score = get_impact_factor(j_name)
             if if_score == 0.0:
                 if_score = get_impact_factor(j_abbr)
 
-            # ROBUST DOI EXTRACTION
             doi = ""
-            # Check AID field (Article ID)
             for aid in record.get("AID", []):
                 if "[doi]" in aid:
                     doi = aid.replace(" [doi]", "")
                     break
-            # Fallback to LID (Location ID)
             if not doi:
                 for lid in record.get("LID", []):
                     if "[doi]" in lid:
@@ -183,7 +178,7 @@ def search_us_pubmed(query, max_results, email, start_date, end_date, exact_phra
                         break
 
             data.append({
-                "Select": False, # For Checkbox
+                "Select": False,
                 "Source": "🇺🇸 US PubMed",
                 "Type": determine_article_type(record.get("PT", [])),
                 "Journal": j_name,
@@ -198,70 +193,98 @@ def search_us_pubmed(query, max_results, email, start_date, end_date, exact_phra
                 "DOI": doi,
                 "PMID": record.get("PMID", "")
             })
-            
         return pd.DataFrame(data)
 
     except Exception as e:
         st.error(f"US PubMed Error: {e}")
         return pd.DataFrame()
 
-# --- SEARCH ENGINE 2: EUROPE PMC ---
+# --- SEARCH ENGINE 2: EUROPE PMC (ROBUST) ---
 
-def search_europe_pmc(query, max_results, start_date, end_date, exact_phrase):
+def search_europe_pmc(query, max_results, start_date, end_date, exact_phrase, email, include_preprints):
     base_url = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
     s_str = start_date.strftime("%Y-%m-%d")
     e_str = end_date.strftime("%Y-%m-%d")
-    date_query = f" AND FIRST_PDATE:[{s_str} TO {e_str}]"
+    
+    # 1. Core Query
     term = f'"{query}"' if exact_phrase else query
-    full_query = f"{term}{date_query}"
+    date_part = f" AND FIRST_PDATE:[{s_str} TO {e_str}]"
+    
+    # 2. Source Filtering (The Toggle Logic)
+    # SRC:MED = Medline (Peer Reviewed)
+    # SRC:PMC = PubMed Central (Peer Reviewed Full Text)
+    # SRC:PPR = Preprints (BioRxiv, MedRxiv, etc.)
+    if include_preprints:
+        # Include everything relevant
+        source_filter = " AND (SRC:MED OR SRC:PMC OR SRC:PPR)"
+    else:
+        # Exclude preprints
+        source_filter = " AND (SRC:MED OR SRC:PMC)"
+    
+    full_query = f"{term}{date_part}{source_filter}"
     
     params = {"query": full_query, "format": "json", "pageSize": max_results, "resultType": "core"}
+    headers = {"User-Agent": f"PubLens-App (Researcher; {email})"}
     
-    try:
-        response = requests.get(base_url, params=params, verify=False)
-        response.raise_for_status()
-        data = response.json()
-        result_list = data.get("resultList", {}).get("result", [])
-        
-        parsed_data = []
-        for item in result_list:
-            j_name = item.get("journalTitle", "")
-            if not j_name: j_name = item.get("journalInfo", {}).get("journal", {}).get("title", "")
-            if j_name is None: j_name = ""
+    for attempt in range(3):
+        try:
+            response = requests.get(base_url, params=params, headers=headers, verify=False)
+            response.raise_for_status()
             
-            # Abbreviation
-            j_abbr = item.get("journalInfo", {}).get("journal", {}).get("medlineAbbreviation", "")
+            data = response.json()
+            result_list = data.get("resultList", {}).get("result", [])
             
-            # Metadata Extraction
-            j_vol = item.get("journalInfo", {}).get("volume", "")
-            j_issue = item.get("journalInfo", {}).get("issue", "")
-            j_pages = item.get("pageInfo", "")
-            
-            parsed_data.append({
-                "Select": False,
-                "Source": "🇪🇺 Europe PMC",
-                "Type": determine_article_type(item.get("pubTypeList", {}).get("pubType", [])),
-                "Journal": j_name,
-                "Abbr": j_abbr,
-                "2023 IF": get_impact_factor(j_name),
-                "Title": item.get("title", ""),
-                "Authors": item.get("authorString", ""),
-                "Date": item.get("firstPublicationDate", ""),
-                "Vol": j_vol,
-                "Issue": j_issue,
-                "Pages": j_pages,
-                "DOI": item.get("doi", ""),
-                "PMID": item.get("pmid", "")
-            })
-            
-        return pd.DataFrame(parsed_data)
+            parsed_data = []
+            for item in result_list:
+                j_name = item.get("journalTitle", "")
+                if not j_name: 
+                    # BioRxiv often puts server name here
+                    j_name = item.get("bookOrReportDetails", {}).get("publisher", "") 
+                if not j_name: j_name = item.get("journalInfo", {}).get("journal", {}).get("title", "")
+                if j_name is None: j_name = ""
+                
+                j_abbr = item.get("journalInfo", {}).get("journal", {}).get("medlineAbbreviation", "")
+                j_vol = item.get("journalInfo", {}).get("volume", "")
+                j_issue = item.get("journalInfo", {}).get("issue", "")
+                j_pages = item.get("pageInfo", "")
+                
+                # Check Type
+                pub_types = item.get("pubTypeList", {}).get("pubType", [])
+                article_type = determine_article_type(pub_types)
 
-    except Exception as e:
-        st.error(f"Europe PMC Error: {e}")
-        return pd.DataFrame()
+                parsed_data.append({
+                    "Select": False,
+                    "Source": "🇪🇺 Europe PMC",
+                    "Type": article_type,
+                    "Journal": j_name,
+                    "Abbr": j_abbr,
+                    "2023 IF": get_impact_factor(j_name),
+                    "Title": item.get("title", ""),
+                    "Authors": item.get("authorString", ""),
+                    "Date": item.get("firstPublicationDate", ""),
+                    "Vol": j_vol,
+                    "Issue": j_issue,
+                    "Pages": j_pages,
+                    "DOI": item.get("doi", ""),
+                    "PMID": item.get("pmid", "")
+                })
+            return pd.DataFrame(parsed_data)
+
+        except requests.exceptions.HTTPError as err:
+            if err.response.status_code == 503:
+                time.sleep(2)
+                continue
+            else:
+                st.error(f"Europe PMC Error: {err}")
+                return pd.DataFrame()
+        except Exception as e:
+            st.error(f"Europe PMC Error: {e}")
+            return pd.DataFrame()
+            
+    st.error("Europe PMC is currently overloaded (503). Try again in a minute.")
+    return pd.DataFrame()
 
 def to_excel(df):
-    # Drop 'Select' column for Excel export
     df_export = df.drop(columns=["Select"], errors="ignore")
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -285,6 +308,9 @@ with st.sidebar:
     st.subheader("Filters")
     exact = st.checkbox("Exact Phrase Match", value=True)
     full_text_us = st.checkbox("Search Full Text (US PMC)", value=True)
+    # NEW TOGGLE
+    include_preprints = st.checkbox("Include BioRxiv/MedRxiv Preprints", value=False)
+    
     limit = st.slider("Max Results (Per Source)", 10, 200, 50)
     
     st.divider()
@@ -325,7 +351,8 @@ if search_btn:
                 df_us = search_us_pubmed(query, limit, email, start_dt, end_dt, exact, full_text_us)
                 frames.append(df_us)
             if use_eu:
-                df_eu = search_europe_pmc(query, limit, start_dt, end_dt, exact)
+                # Pass include_preprints toggle
+                df_eu = search_europe_pmc(query, limit, start_dt, end_dt, exact, email, include_preprints)
                 frames.append(df_eu)
             
             if frames:
@@ -334,49 +361,34 @@ if search_btn:
                 df_combined = pd.DataFrame()
 
             if not df_combined.empty:
-                # SCORING & DEDUPING
                 df_combined["_score"] = 0
-                # Prefer rows with DOIs
                 df_combined.loc[df_combined["DOI"].fillna("").astype(str).str.len() > 5, "_score"] += 20
-                # Prefer rows with Journal Abbrev (for citations)
                 df_combined.loc[df_combined["Abbr"].fillna("").astype(str).str.len() > 1, "_score"] += 10
-                # Prefer US source
                 df_combined.loc[df_combined["Source"].astype(str).str.contains("US"), "_score"] += 5
                 
                 df_combined["_clean_doi"] = df_combined["DOI"].fillna("").str.lower().str.strip()
                 df_combined = df_combined.sort_values(by="_score", ascending=False)
                 
-                # Dedup by DOI then Title
                 df_dedup = df_combined.drop_duplicates(subset=["_clean_doi"])
-                # Remove rows with empty DOIs from result to dedup by title
-                # Actually simplest is to just Dedup by Title separately
                 df_dedup = df_dedup.drop_duplicates(subset=["Title"])
                 
                 st.success(f"✅ Found {len(df_dedup)} publications")
                 
-                # Format IF
                 df_dedup["2023 IF"] = pd.to_numeric(df_dedup["2023 IF"], errors='coerce').fillna(0.0)
                 df_dedup = df_dedup.sort_values(by="2023 IF", ascending=False)
                 
-                # Store in session state so selection persists
                 st.session_state['results_df'] = df_dedup
-
-# --- RESULTS DISPLAY & CITATION GENERATION ---
 
 if 'results_df' in st.session_state:
     df = st.session_state['results_df']
-    
-    # Reorder columns for display (Hide metadata cols used for citation but maybe clutter view?)
-    # We keep them for now so you can verify data
     display_cols = ["Select", "Source", "Type", "Journal", "2023 IF", "Title", "Date", "DOI", "Abbr", "Vol", "Issue", "Pages"]
     final_cols = [c for c in display_cols if c in df.columns]
     
-    # INTERACTIVE EDITOR
     edited_df = st.data_editor(
         df[final_cols],
         use_container_width=True,
         column_config={
-            "Select": st.column_config.CheckboxColumn("Select", help="Check to generate citation"),
+            "Select": st.column_config.CheckboxColumn("Select"),
             "Type": st.column_config.TextColumn("Type", width="small"),
             "2023 IF": st.column_config.NumberColumn("2023 IF", format="%.1f"),
             "DOI": st.column_config.LinkColumn("DOI")
@@ -385,40 +397,19 @@ if 'results_df' in st.session_state:
     )
     
     col_a, col_b = st.columns([1, 4])
-    
     with col_a:
-        st.download_button(
-            "📥 Download Excel",
-            data=to_excel(df),
-            file_name=f"PubLens_Results.xlsx"
-        )
-        
+        st.download_button("📥 Download Excel", data=to_excel(df), file_name=f"PubLens_Results.xlsx")
     with col_b:
-        # CITATION GENERATOR
         if st.button("📝 Generate Citations for Selected"):
-            # Filter for selected rows
             selected_rows = edited_df[edited_df["Select"] == True]
-            
             if not selected_rows.empty:
-                st.markdown("### Formatted Citations")
-                
-                # Generate text block
                 citation_text = ""
                 for index, row in selected_rows.iterrows():
-                    # We need to pull the full data from the original DF to get Authors (which might be hidden/truncated)
-                    # But here we included Authors in display? No I removed it from 'display_cols' list above to save space?
-                    # Wait, I need Authors for citation.
-                    # Let's look up the row in the original DF using Title or DOI matches, 
-                    # OR just ensure Authors is in the edited_df. 
-                    # Authors is NOT in 'final_cols' list above!
-                    # Correction: Authors IS needed. I will grab it from session state using Index.
-                    
-                    # Get original row data using the index from the edited dataframe
-                    # (Indices should align if we didn't sort the edited view differently, 
-                    # but data_editor preserves index).
-                    original_row = df.loc[index]
-                    citation_text += generate_citation(original_row) + "\n\n"
-                
+                    try:
+                        original_row = df.loc[index]
+                        citation_text += generate_citation(original_row) + "\n\n"
+                    except:
+                        pass
                 st.text_area("Copy Citations", value=citation_text, height=200)
             else:
-                st.warning("Please select at least one paper using the checkboxes.")
+                st.warning("Select papers first.")
