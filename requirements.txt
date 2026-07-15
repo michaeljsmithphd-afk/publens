@@ -1,6 +1,0 @@
-streamlit
-pandas
-biopython
-requests
-openpyxl
-urllib3
