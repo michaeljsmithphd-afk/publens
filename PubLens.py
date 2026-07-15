@@ -1,4 +1,6 @@
 
+import os
+import json
 import streamlit as st
 import pandas as pd
 from Bio import Entrez, Medline
@@ -11,6 +13,8 @@ import time
 import re
 import http.client
 from io import BytesIO
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 try:
     from PyPDF2 import PdfReader
@@ -23,8 +27,13 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # --- CONFIGURATION ---
 st.set_page_config(page_title="PubLens", page_icon="🔬", layout="wide")
 
-# NOTE: This key was explicitly provided by the user in this chat.
-NCBI_API_KEY = "58bebfaec2c401d129ce9f3f48996b66c109"
+def get_ncbi_api_key():
+    try:
+        return st.secrets["NCBI"]["api_key"]
+    except Exception:
+        return os.getenv("NCBI_API_KEY", "")
+
+NCBI_API_KEY = get_ncbi_api_key()
 
 REQUEST_HEADERS = {
     "User-Agent": (
@@ -33,8 +42,20 @@ REQUEST_HEADERS = {
     )
 }
 
-# --- INTERNAL DATABASE (2023 JIF) ---
-INTERNAL_METRICS = {
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "OPTIONS"],
+)
+HTTP_SESSION = requests.Session()
+HTTP_SESSION.headers.update(REQUEST_HEADERS)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+HTTP_SESSION.mount("https://", adapter)
+HTTP_SESSION.mount("http://", adapter)
+
+# --- JOURNAL METRICS (externalized for easier maintenance) ---
+LEGACY_JOURNAL_METRICS = {
     "nature": 50.5, "science": 44.7, "cell": 45.5,
     "pnas": 9.6, "proc natl acad sci u s a": 9.6,
     "nature communications": 14.7, "nat commun": 14.7,
@@ -79,12 +100,9 @@ INTERNAL_METRICS = {
     "nature reviews immunology": 88.1, "nat rev immunol": 88.1,
     "nature reviews genetics": 39.1, "nat rev genet": 39.1,
     "nature reviews drug discovery": 110.5, "nat rev drug discov": 110.5,
-    "cell research": 28.1, "cell res": 28.1
+    "cell research": 28.1, "cell res": 28.1,
 }
 
-# =============================================================================
-# HELPERS
-# =============================================================================
 
 def normalize_journal_name(name):
     if not name:
@@ -93,15 +111,63 @@ def normalize_journal_name(name):
     return " ".join(clean.split())
 
 
+def normalize_metrics_mapping(raw_metrics):
+    normalized = {}
+    for key, value in (raw_metrics or {}).items():
+        if key is None:
+            continue
+        try:
+            normalized[normalize_journal_name(key)] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return normalized
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def load_journal_metrics():
+    metrics = dict(LEGACY_JOURNAL_METRICS)
+
+    metrics_url = os.getenv("JOURNAL_METRICS_URL")
+    if metrics_url:
+        try:
+            response = requests.get(metrics_url, timeout=20, headers=REQUEST_HEADERS)
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, dict):
+                metrics.update(normalize_metrics_mapping(payload))
+                return metrics
+        except Exception:
+            pass
+
+    metrics_path = os.path.join(os.path.dirname(__file__), "journal_metrics.json")
+    if os.path.exists(metrics_path):
+        try:
+            with open(metrics_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if isinstance(payload, dict):
+                metrics.update(normalize_metrics_mapping(payload))
+        except Exception:
+            pass
+
+    return metrics
+
+
+JOURNAL_METRICS = load_journal_metrics()
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
 def get_impact_factor(journal_name):
     if not journal_name:
         return 0.0
     clean_name = normalize_journal_name(journal_name)
-    if clean_name in INTERNAL_METRICS:
-        return INTERNAL_METRICS[clean_name]
-    for key in INTERNAL_METRICS:
+    metrics = load_journal_metrics()
+    if clean_name in metrics:
+        return metrics[clean_name]
+    for key in metrics:
         if key in clean_name and len(key) > 4:
-            return INTERNAL_METRICS[key]
+            return metrics[key]
     return 0.0
 
 
@@ -201,10 +267,30 @@ def extract_visible_text_from_html(html):
     return html.strip()
 
 
+def request_with_retry(url, params=None, timeout=20, headers=None):
+    for attempt in range(4):
+        try:
+            response = HTTP_SESSION.get(url, params=params, headers=headers, timeout=timeout, allow_redirects=True)
+            response.raise_for_status()
+            return response
+        except requests.exceptions.HTTPError as err:
+            status_code = getattr(err.response, "status_code", None)
+            if status_code in {429, 500, 502, 503, 504} and attempt < 3:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+        except requests.exceptions.RequestException:
+            if attempt < 3:
+                time.sleep(1 * (attempt + 1))
+                continue
+            raise
+    raise RuntimeError(f"Request failed for {url}")
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
 def fetch_url_text(url, timeout=18, max_pdf_pages=25):
     try:
-        r = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout, verify=False, allow_redirects=True)
-        r.raise_for_status()
+        r = request_with_retry(url, timeout=timeout)
         content_type = r.headers.get("Content-Type", "").lower()
         final_url = r.url.lower()
         if ("pdf" in content_type or final_url.endswith(".pdf")) and PdfReader is not None:
@@ -374,8 +460,7 @@ def search_europe_pmc(query, max_results, start_date, end_date, email, include_p
         success = False
         for attempt in range(3):
             try:
-                response = requests.get(base_url, params=params, headers=headers, verify=False, timeout=15)
-                response.raise_for_status()
+                response = request_with_retry(base_url, params=params, timeout=15, headers=headers)
                 data = response.json()
                 result_list = data.get("resultList", {}).get("result", [])
                 if not result_list:
@@ -480,8 +565,7 @@ def search_google_scholar(query, api_key, max_results, start_year, end_year, sea
         }
 
         try:
-            response = requests.get(base_url, params=params, headers=REQUEST_HEADERS, verify=False, timeout=20)
-            response.raise_for_status()
+            response = request_with_retry(base_url, params=params, timeout=20, headers=REQUEST_HEADERS)
             data = response.json()
             organic = data.get("organic_results", [])
             if not organic:
@@ -617,6 +701,7 @@ def search_google_scholar(query, api_key, max_results, start_year, end_year, sea
 # ENRICHMENT
 # =============================================================================
 
+@st.cache_data(show_spinner=False, ttl=3600)
 def enrich_with_pubmed(title, doi, email):
     Entrez.email = email
     Entrez.api_key = NCBI_API_KEY
@@ -831,7 +916,7 @@ if search_btn:
     if use_pmc:
         with st.status("Searching PMC full text...", expanded=False):
             df_pmc, s = search_pmc_fulltext(query, limit, email, start_dt, end_dt, search_mode)
-            stats.update({**stats, **s})
+            stats.update(s)
             if not df_pmc.empty:
                 frames.append(df_pmc)
 
@@ -844,7 +929,7 @@ if search_btn:
     if use_gs and serp_key:
         with st.status("Searching Google Scholar and validating links...", expanded=False):
             df_gs, s = search_google_scholar(query, serp_key, limit, s_year, e_year, search_mode, validate_links=True)
-            stats.update({**stats, **s})
+            stats.update(s)
             if not df_gs.empty:
                 frames.append(df_gs)
 
