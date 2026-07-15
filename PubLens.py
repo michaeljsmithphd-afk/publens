@@ -747,8 +747,8 @@ def to_excel(df):
 
 st.title("🔬 PubLens")
 st.markdown(
-    "Find **primary research papers** that mention a Leica technology as an **exact phrase**. "
-    "The app searches **PMC full text**, **Europe PMC**, and **Google Scholar**, then removes false positives by validating exact phrase matches."
+    "Find research papers and related records that mention a Leica technology term. "
+    "The app can search **PMC full text**, **Europe PMC**, and **Google Scholar** using exact-phrase, all-terms, or any-terms matching, then validates matches to reduce false positives."
 )
 
 with st.sidebar:
